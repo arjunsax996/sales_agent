@@ -1,0 +1,5 @@
+[
+  { "chemicalName": "IPA", "quantity": 200, "unit": "gal" },
+  { "chemicalName": "caustic soda", "quantity": 500, "unit": "kg" },
+  { "chemicalName": "unobtainium", "quantity": 10, "unit": "kg" }
+]

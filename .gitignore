@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env*.local
+.vercel/
+db/*.json
+output/
+.next/
+dist/
+*.log
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+PLAN.md
+.vscode/
+.claude/

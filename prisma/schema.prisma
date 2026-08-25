@@ -1,0 +1,65 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  OVERRIDDEN
+}
+
+// One row per SKU. Catalog + cost/sales fields come straight from
+// products.csv; recommendation fields are written once by scripts/seed.ts
+// (the LangGraph pipeline in agent/); review fields are the only thing the
+// web app itself ever mutates.
+model Product {
+  sku          String @id
+  baseChemical String
+  grade        String
+  packSize     String
+  category     String
+
+  lastYearCost    Float
+  lastYearPrice   Float
+  newCost         Float
+  lastYearRevenue Float
+  winRate         Float?
+
+  recommendedPrice Float
+  marginPct        Float
+  rationale        String
+  needsHumanReview Boolean @default(false)
+  reviewReason     String?
+
+  // Denormalized from the family-level strategy node (agent/nodes/build-strategy.ts)
+  // so the review UI can show "why this whole family moved" next to the SKU's
+  // own rationale, without a join.
+  familyRationale            String?
+  familyTargetMarginDeltaPct Float?
+  // The actual CRM note excerpts buildStrategy cited when setting the family's
+  // strategy — lets a reviewer check the AI's rationale against the source
+  // text, not just trust its paraphrase of it.
+  familyCitedNotes           String[] @default([])
+
+  // abs dollar impact of the recommended change vs. last year, used to sort
+  // "most important decisions first" — lastYearRevenue * pctChange(price).
+  // 0 for SKUs with no sales history (nothing to weigh the change against).
+  revenueImpact Float @default(0)
+
+  reviewStatus  ReviewStatus @default(PENDING)
+  overridePrice Float?
+  overrideNote  String?
+  reviewedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([needsHumanReview, revenueImpact])
+  @@index([baseChemical])
+  @@index([reviewStatus])
+}
