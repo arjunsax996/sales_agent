@@ -13,3 +13,5 @@ next-env.d.ts
 PLAN.md
 .vscode/
 .claude/
+.vercel
+.env*
