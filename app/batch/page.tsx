@@ -164,17 +164,19 @@ function FileField({
 }) {
   return (
     <label className="block text-sm font-medium">
-      {label}
-      {required ? " *" : ""}
+      <span className="block">
+        {label}
+        {required ? " *" : ""}
+      </span>
       <input
         type="file"
         accept=".csv,text/csv"
         disabled={disabled}
         onChange={(e) => onChange(e.target.files?.[0] ?? null)}
-        className="mt-1 block w-full text-sm"
+        className="mt-2 block w-full text-sm text-[color:var(--text-muted)] file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-[var(--accent)] file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:opacity-90 disabled:file:cursor-not-allowed disabled:file:opacity-50"
       />
       {file && (
-        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+        <span className="mt-1 block text-xs" style={{ color: "var(--text-muted)" }}>
           {file.name}
         </span>
       )}
