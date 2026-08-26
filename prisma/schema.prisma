@@ -13,6 +13,30 @@ enum ReviewStatus {
   OVERRIDDEN
 }
 
+enum BatchJobState {
+  RUNNING
+  DONE
+  ERROR
+}
+
+// Durable progress tracker for a /batch run, replacing an in-memory
+// singleton that couldn't survive Vercel's serverless runtime (see
+// lib/batchJob.ts and agent/run.ts's Inngest fan-out). One row per run;
+// familiesDone/familiesFailed are advanced by atomic increments from each
+// family's own Inngest function invocation, not by a single long request.
+model BatchJob {
+  id             String        @id @default(cuid())
+  state          BatchJobState @default(RUNNING)
+  totalFamilies  Int
+  familiesDone   Int           @default(0)
+  familiesFailed Int           @default(0)
+  currentFamily  String?
+  message        String?
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+}
+
 // One row per SKU. Catalog + cost/sales fields come straight from
 // products.csv; recommendation fields are written once by scripts/seed.ts
 // (the LangGraph pipeline in agent/); review fields are the only thing the

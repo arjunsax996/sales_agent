@@ -2,6 +2,7 @@ import { z } from "zod";
 import { reasoningModel } from "../models";
 import type { RepricingStateT } from "../state";
 import { log } from "../../shared/log";
+import { withRetry } from "../../shared/retry";
 import { pctChange, round2 } from "../../shared/util";
 
 /**
@@ -33,28 +34,33 @@ export async function buildStrategy(state: RepricingStateT): Promise<Partial<Rep
     };
   });
 
+  const startedAt = Date.now();
   let result: z.infer<typeof familyStrategySchema>;
   try {
-    result = await structuredModel.invoke([
-      {
-        role: "system",
-        content: `You are a pricing strategist for a chemical distributor.
+    result = await withRetry(
+      () =>
+        structuredModel.invoke([
+          {
+            role: "system",
+            content: `You are a pricing strategist for a chemical distributor.
 Given cost trends, historical revenue/win-rate, and sales-note directives for one product family, set a single target margin-delta (percentage points vs. last year) for the whole family.
 High win rate + rising cost pressure = room to push margin up. Low win rate, "doubleRisk" SKUs, or explicit customer pushback in notes = hold or reduce margin.
 Be conservative on contradictory signals, and weigh leadership-level directives (GM/VP notes) over a single rep's opinion.`,
-      },
-      {
-        role: "user",
-        content: JSON.stringify({ baseChemical: state.baseChemical, skus: aggregate, noteDirectives: state.noteDirectives }),
-      },
-    ]);
+          },
+          {
+            role: "user",
+            content: JSON.stringify({ baseChemical: state.baseChemical, skus: aggregate, noteDirectives: state.noteDirectives }),
+          },
+        ]),
+      { label: `buildStrategy:${state.baseChemical}` }
+    );
   } catch (err) {
     throw new Error(`buildStrategy failed for family "${state.baseChemical}": ${(err as Error).message}`, { cause: err });
   }
 
   log(
     "buildStrategy",
-    `${state.baseChemical}: target margin ${result.targetMarginDeltaPct >= 0 ? "+" : ""}${result.targetMarginDeltaPct}pt vs. last year`
+    `${state.baseChemical}: target margin ${result.targetMarginDeltaPct >= 0 ? "+" : ""}${result.targetMarginDeltaPct}pt vs. last year in ${Date.now() - startedAt}ms`
   );
 
   return { familyStrategy: result };

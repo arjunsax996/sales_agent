@@ -1,10 +1,12 @@
 "use server";
 
 import { loadNotes, parseNotesCsv, parseProductsCsv } from "@/agent";
-import { type BatchJobStatus, getBatchJobStatus, isBatchJobRunning, startBatchJob } from "@/lib/batchJob";
+import { type BatchJobStatus, getBatchJobStatus, isBatchJobRunning } from "@/lib/batchJob";
+import { inngest } from "@/lib/inngest/client";
+import { prisma } from "@/lib/prisma";
 
 export async function uploadAndStartBatch(productsCsvText: string, notesCsvText: string | null): Promise<{ totalFamilies: number }> {
-  if (isBatchJobRunning()) throw new Error("A batch job is already running — wait for it to finish before starting another.");
+  if (await isBatchJobRunning()) throw new Error("A batch job is already running — wait for it to finish before starting another.");
   if (!process.env.OPENAI_API_KEY?.trim()) {
     throw new Error("OPENAI_API_KEY isn't set on the server — the batch agent needs it to generate recommendations.");
   }
@@ -15,8 +17,14 @@ export async function uploadAndStartBatch(productsCsvText: string, notesCsvText:
   // Notes are optional per upload — fall back to the bundled default set so a
   // cost-only update still gets the benefit of existing CRM context.
   const notes = notesCsvText ? parseNotesCsv(notesCsvText) : loadNotes("data/notes.csv");
+  const totalFamilies = new Set(products.map((p) => p.baseChemical)).size;
 
-  const totalFamilies = startBatchJob(products, notes);
+  // Create the row before sending the event (rather than letting the
+  // Inngest function create it) so a poll immediately after this action
+  // returns can never see "idle" in the gap before the function starts.
+  const job = await prisma.batchJob.create({ data: { totalFamilies } });
+  await inngest.send({ name: "batch/reprice.requested", data: { jobId: job.id, products, notes } });
+
   return { totalFamilies };
 }
 

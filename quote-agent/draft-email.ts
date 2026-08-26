@@ -6,8 +6,8 @@ import type { Quotation } from "./types";
 /**
  * Turns the already-computed Quotation (pricing/matching logic is untouched,
  * this only writes prose around it) into a customer-facing email. Uses the
- * cheap/fast model, same as extractNotes — this is formatting, not reasoning
- * about a price.
+ * cheap/fast model, same as agent/note-routing.ts — this is formatting, not
+ * reasoning about a price.
  */
 
 const emailSchema = z.object({

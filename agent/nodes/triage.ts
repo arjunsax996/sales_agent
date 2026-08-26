@@ -1,7 +1,15 @@
 import type { RepricingStateT } from "../state";
-import type { SkuRecommendation } from "../types";
+import type { ProductRow, SkuRecommendation } from "../types";
 import { log } from "../../shared/log";
 import { round2 } from "../../shared/util";
+
+// Family-level version of the same "has real sales history" check triage()
+// does per SKU — used by run.ts to decide which families need the note-
+// routing pre-pass at all (formulaic-only families never reach buildStrategy,
+// so routing notes to them would be wasted work).
+export function familyNeedsReasoning(products: ProductRow[]): boolean {
+  return products.some((p) => p.winRate !== null);
+}
 
 /**
  * Triage / routing — pure code, no LLM. This is where the catalog patterns

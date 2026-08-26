@@ -3,5 +3,7 @@
 
 export { repricingApp } from "./graph";
 export { loadNotes, loadProducts, parseNotesCsv, parseProductsCsv } from "./load-data";
+export { familyNeedsReasoning } from "./nodes/triage";
+export { routeNotesToFamilies } from "./note-routing";
 export { repriceCatalog, repriceFamily } from "./run";
 export type { FamilyStrategy, GuardrailIssue, NoteDirective, ProductRow, SkuRecommendation } from "./types";
