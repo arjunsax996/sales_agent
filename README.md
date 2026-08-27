@@ -1,175 +1,179 @@
 # AI-Powered Product Repricing
 
-A review tool for repricing a ~1,100-SKU chemical catalog: an AI pipeline generates a
-priced recommendation with a rationale for every SKU, a reviewer works a prioritized
-queue instead of 1,100 rows, and every override is persisted.
+A review tool for a ~1,100-SKU chemical catalog: a pipeline prices and justifies every
+SKU, a reviewer works a prioritized queue instead of all 1,100 rows, and every override
+is persisted. Two supporting tools share the same data — a browser-based batch
+re-pricing flow, and a quote generator that drafts a priced customer email.
 
 ## Architecture
 
 ```
 data/products.csv, data/notes.csv
         │
-        ▼
-scripts/seed.ts  ──▶  agent/ (LangGraph)  ──▶  Postgres (Prisma)
-  (one-time batch)                                    │
-                                                        ▼
-                                          Next.js review UI (app/)
-                                          reads/writes review state only
+        ├──▶ scripts/seed.ts (CLI)  ──┐
+        │                             ▼
+        └──▶ app/batch (upload) ──▶ agent/ (LangGraph)  ──▶  Postgres (Prisma)
+                  via Inngest                                      │
+                                                                    ▼
+                                                    Next.js UI: review (/), quote (/quote)
 ```
 
-The LLM only runs in `scripts/seed.ts`, a batch job — mirroring how the business
-actually reprices (an annual pass, not a live per-request call). The web app never calls
-an LLM; it reads recommendations Postgres already has and writes review decisions back
-to the same table. No API key needed at request time, only to (re)generate
-recommendations.
+Recommendations come from two entry points into the same `agent/` pipeline: the CLI
+(`npm run seed`) for the initial load, and `/batch` for re-running it from the browser.
+Both write to the `Product` table. The review UI (`/`) only reads/writes review state
+there — it never calls an LLM. `/quote` is the exception: it calls the LLM live, per
+request.
 
-### The repricing agent (`agent/`) — LangGraph
+## The repricing agent (`agent/`) — LangGraph
 
 ```
-triage (code, no LLM)
-  │ no sales history → formulaic price, skip LLM
-  │ has sales history →
-  ▼
-extractNotes → buildStrategy → priceSkus → guardrailCritic ─┬─ issues found → retry priceSkus (max 2x)
-                                                              └─ clean → finalize
+START -> triage -+-> (no SKUs need reasoning) ---------------+
+                  |                                          |
+                  +-> (some SKUs need reasoning) -> buildStrategy
+                                                         |     |
+                                                         v     |
+                                                     priceSkus |
+                                                         |     |
+                                                         v     v
+                                                   guardrailCritic -(retry, LLM path only)-> priceSkus
+                                                                        |
+                                                                     (done)
+                                                                        v
+                                                                     finalize -> END
 ```
 
-- Grouped by base chemical, not SKU: ~221 base chemicals across multiple grades and pack
-  sizes, so pricing a SKU in isolation throws away the context a human pricer would use
-  ("IPA is under margin pressure across the board" applies to every pack size). ~221
-  graph invocations instead of ~1,142.
-- `triage` is deterministic. 57% of SKUs have zero prior-year sales, so there's no signal
-  for an LLM to add over "hold last year's margin % against this year's cost." Skips the
-  model entirely for the majority of the catalog; falls back to zero-markup pass-through
-  and force-flags for review when even that formula is undefined (missing/zero price).
-- `extractNotes` resolves informal CRM language ("IPA," "caustic") against one family's
-  notes into typed directives, turning 130 unstructured notes into something
-  `buildStrategy` can reason over per family.
-- `buildStrategy` sets one target margin delta per family from cost/revenue/win-rate
-  trends plus those note directives, weighting leadership directives over a single rep's.
-- `priceSkus` applies that strategy per SKU, then reconciles the model's response against
-  the SKUs actually asked about — drops hallucinated SKUs, force-flags any silently
-  dropped.
-- `guardrailCritic` (deterministic): margin floor, 30%-swing cap, and a cross-grade check
-  (a lower grade shouldn't price above a higher grade at the same pack size — a bug that
-  already existed in last year's data). Runs against every recommendation; a failure
-  loops back to `priceSkus` with feedback, up to 2 retries, then force-flags.
+- **`triage`** (no LLM): ~57% of SKUs have no prior-year sales, so there's nothing to
+  reason about — those get a formulaic hold-last-year's-margin price. Only SKUs with real
+  sales history reach the reasoning path.
+- **Note routing** (`agent/note-routing.ts`) runs once per catalog run, not per family.
+  It chunks reasoning-path families into groups of ~20 and asks the model, once per
+  chunk, which CRM notes apply to which family — avoiding 150+ redundant LLM calls
+  against the same ~130-note corpus.
+- **`buildStrategy`** sets one target margin delta per family from cost/revenue/win-rate
+  trends plus its routed note directives.
+- **`priceSkus`** applies that strategy per SKU, then reconciles the response against the
+  SKUs actually asked about: drops hallucinated SKUs, dedupes repeats, force-flags any
+  the model silently dropped.
+- **`guardrailCritic`** (no LLM): margin floor, 30%-swing cap, cross-grade ordering check.
+  Runs against every recommendation; a failure loops back to `priceSkus` with feedback,
+  up to 2 retries, then force-flags for review.
+- Runs once per base-chemical family (~221) rather than per SKU (~1,100), so a strategy
+  is reasoned about once per chemical and applied across its pack-size/grade variants.
 
-### Scale: what actually gets surfaced
+Every LLM call retries transient errors (429s, 5xx, timeouts) with backoff via
+`shared/retry.ts`'s `withRetry`, 3 attempts before giving up on that family alone.
 
-1. `needsHumanReview` is set throughout the pipeline, not bolted on after the fact.
-2. `revenueImpact` (`|Δprice| × last year's revenue`) ranks flagged SKUs by dollars at
-   stake, not alphabetically.
-3. Bulk-approve clears everything the AI didn't flag in one click, so review is ~16% of
-   the catalog, not all of it. (Was 83% until a bug got fixed — see below.)
-4. A "why flagged" breakdown buckets review reasons (grade ordering, win-rate extremes,
-   margin/cost) so a reviewer sees what kind of attention 187 SKUs need before opening
-   one.
-5. Auto-advance jumps the drawer to the next SKU needing a decision instead of a
-   close-then-click round trip per row.
+### Two ways to run the pipeline
 
-### Persistence
+- **`scripts/seed.ts`** (CLI) — a 15-worker pool (`agent/run.ts`) pulls families off a
+  shared queue, persisting each as it finishes.
+- **`/batch`** (browser) — same pipeline, run through Inngest instead of the worker pool
+  (see below), so it isn't bound to one process or one request.
+
+## Batch updates (`/batch`) — Inngest
+
+A multi-minute, hundreds-of-LLM-call job can't run inside one web request — Vercel kills
+serverless functions once the response is sent, long before 221 families finish. Instead:
+uploading a CSV creates a `BatchJob` row in Postgres (durable progress; an in-memory
+variable wouldn't survive a serverless cold start) and sends one Inngest event. One
+function groups the upload into families and routes notes once, then fans out one event
+per family. A second function processes each family independently — concurrency-limited
+to 5 (Inngest's free-tier cap) — so every HTTP invocation does only one family's work,
+well under any serverless timeout, and atomically advances the `BatchJob` row until every
+family is accounted for. The page polls that row every 2 seconds. Unaffected SKUs' review
+state is left untouched; new SKUs are added, existing ones get fresh recommendations.
+
+## Quotes (`/quote`)
+
+Turns a company + requested chemicals/quantities into a priced, AI-drafted email.
+Informal names ("IPA", "caustic soda") resolve against an embedding index over the
+catalog's ~221 base chemical names (`db/chemical-index.ts`), matched against only the
+top-k nearest candidates rather than the whole catalog. Primary output is the drafted
+email; an itemized breakdown sits below it. Without `OPENAI_API_KEY`, falls back to a
+substring match and a templated, non-AI email instead of failing outright.
+
+## Persistence and review UI
 
 One `Product` table (Prisma/Postgres) holds catalog fields, the AI's recommendation and
-rationale, and review state together, so progress survives a refresh or restart.
-`scripts/seed.ts` persists per family as each finishes rather than buffering all 221 in
-memory, so one family's OpenAI error doesn't cost the ones that already succeeded.
+rationale, and review state together — no join, since ~221 families × ~5 SKUs each makes
+a separate family table pointless. A Server Component runs one pre-sorted
+`findMany` (`needsHumanReview desc, revenueImpact desc`); a client component
+filters/searches/paginates in memory. Mutations are Server Actions through Prisma with
+`revalidatePath`. Each row's drawer shows the SKU's rationale, the family strategy
+rationale (with cited note excerpts), the guardrail reason if flagged, and an editable
+price with an override note. `revenueImpact` ranks flagged SKUs by dollars at stake, and
+bulk-approve clears everything unflagged in one click.
 
-### Review UI (`app/`)
+## Tradeoffs and known limitations
 
-A Server Component does one pre-sorted `prisma.product.findMany`
-(`needsHumanReview desc, revenueImpact desc`); a client component filters/searches that
-in memory. Mutations (`approve` / `override` / `reset` / bulk-approve) are Server Actions
-writing through Prisma with `revalidatePath`. Each row's drawer shows the SKU's own
-rationale, the family-level strategy rationale (with the actual CRM note excerpts cited),
-the specific guardrail reason if flagged, and an editable price with an override note.
+- **`scripts/seed.ts`'s worker pool isn't resumable** — a crash mid-run needs a full
+  re-seed (safe, since upserts are idempotent, just not efficient). `/batch`'s Inngest
+  path doesn't have this problem.
+- **`quote-agent`'s embedding cache is a local JSON file**, not Postgres — survives
+  within one warm serverless instance but not across cold starts on Vercel. `pgvector`
+  would fix that.
+- **A family's whole graph run is one Inngest step**, not one per LLM call. A guardrail
+  retry has taken ~24-30s in testing — under the `maxDuration = 60` on
+  `app/api/inngest/route.ts`, but more retries could need that raised, or the step split.
+- **No auth, no multi-user review state, no per-user override attribution.**
 
-### What actually broke
+## What's next
 
-Two real bugs surfaced by running against live OpenAI calls and real Postgres data, not
-just reading the code:
+- Move `quote-agent`'s embedding cache into Postgres (`pgvector`).
+- Split `repriceFamily`'s Inngest step into one step per graph node.
+- Bulk actions within the flagged queue itself, not just "approve all unflagged."
+- Sortable columns and family-grouped rows — sibling SKUs are scattered today.
+- CSV export of the reviewed price list.
+- Audit trail (who overrode what, when) — needs auth.
 
-- `priceSkus`'s structured-output schema 400'd on every family — `.optional()` isn't
-  allowed under OpenAI strict mode, only `.nullable()`. Failed on the first family of the
-  first full run; fixed and re-ran clean across all 221.
-- A guardrail rule flagged 86% of everything for the wrong reason: the cross-grade check
-  treated "no grade in the product name" (512/1,142 SKUs — just missing data) the same as
-  "unrecognized grade value" (a real anomaly). That single conflation generated 812 of
-  943 flags. Fixed to skip blank grades silently, flagged count dropped to 187 (16%).
-  Found by querying the actual `reviewReason` distribution in Postgres, not by
-  inspection.
-
-## Key design decisions
-
-- Family-level graph, not per-SKU — fewer LLM calls, catches cross-grade bugs, matches
-  how a human pricer thinks about a family of pack sizes/grades.
-- Deterministic triage before any LLM call — no model call where there's no signal
-  (no sales history) or no defined formula (missing last-year price).
-- Batch job, not a live agent — mirrors the business's actual annual cadence, and means
-  the deployed app works with no OpenAI key at request time.
-- One Prisma table, not a normalized schema — `familyRationale` etc. denormalized onto
-  every SKU; at 221 families × ~5 SKUs each, a join buys nothing.
-
-## Tradeoffs
-
-- No retry/backoff on OpenAI calls beyond the guardrail-driven reprice. A transient error
-  drops that family; re-running `scripts/seed.ts` is safe (idempotent upserts) but not
-  automatic.
-- `extractNotes` sends all 130 notes to every family — fine at this scale, but no
-  relevance filtering before the call.
-- Concurrency is a fixed batch of 5 in one Node process, not a real job queue — a
-  mid-run crash needs a full re-seed, not resumption.
-- No auth, no multi-user review state, no per-user override attribution.
-- `quote-agent/` (turns a company + requested chemicals/quantities into an ad-hoc quote,
-  via an embedding index over base-chemical names) is reachable at `/quote`, reading live
-  from the same `Product` table. Its embedding cache (`db/chemical-index.ts`) writes to a
-  local JSON file — works locally and survives one warm Vercel instance (re-synced from
-  Postgres each request), but doesn't durably cache across cold starts there. Real fix:
-  move the cache into Postgres (`pgvector`), not done here.
-
-## What I'd do with more time
-
-- Real job runner (Inngest) for `scripts/seed.ts` with per-family retry, so a transient
-  error doesn't drop a family and re-pricing one family doesn't require a full re-seed.
-- Relevance/retrieval pass before `extractNotes` instead of sending all notes to every
-  family (same idea already used in `quote-agent`'s chemical matching).
-- Bulk actions within the flagged queue itself (multi-select, "approve all reason X"),
-  not just "approve all unflagged."
-- Sortable columns and family-grouped rows — sibling SKUs are scattered in the flat list
-  today.
-- CSV export of the reviewed price list — the only way out right now is querying
-  Postgres directly.
-- Audit trail (who overrode what, when) — needs auth, out of scope here.
-- Wire `quote-agent/` into the review UI as a page calling `buildQuote` via a Server
-  Action — it already reads the same data.
-
-## Running it
+## Running it locally
 
 ```bash
 npm install
-# Postgres: point DATABASE_URL (.env) at any Postgres instance, e.g. a local
-# `docker run -e POSTGRES_USER=repricing -e POSTGRES_PASSWORD=repricing \
-#    -e POSTGRES_DB=repricing -p 5433:5432 postgres:16-alpine`
+
+# Postgres — point storage_PRISMA_DATABASE_URL (.env) at any Postgres instance, e.g.:
+#   docker run -e POSTGRES_USER=repricing -e POSTGRES_PASSWORD=repricing \
+#     -e POSTGRES_DB=repricing -p 5433:5432 postgres:16-alpine
 npx prisma migrate dev
 
-# Set OPENAI_API_KEY in .env, then generate recommendations for the whole catalog:
+# OPENAI_API_KEY in .env, then generate recommendations for the whole catalog:
 npm run seed
 
 npm run dev
 # → http://localhost:3000
 ```
 
-`quote-agent/` runs standalone via `npm run quote -- --company "..." --items <file.json>`
-(defaults to `quote-agent/example-request.json`) — reads the same Postgres table
-`npm run seed` populates.
+`/batch` also needs a local Inngest dev server (Inngest orchestrates the fan-out even in
+dev):
+
+```bash
+# .env: INNGEST_DEV=1
+npx inngest-cli dev -u http://localhost:3000/api/inngest
+```
+
+`quote-agent` runs standalone via
+`npm run quote -- --company "..." --items <file.json>` (defaults to
+`quote-agent/example-request.json`), reading the same Postgres table `npm run seed`
+populates.
 
 ## Deploying
 
-`next build` succeeds with zero database access (review page is `dynamic =
-"force-dynamic"`), and `postinstall: "prisma generate"` regenerates the client for
-Vercel's build platform rather than shipping a locally-generated one. Provision a
-Postgres reachable over the internet (Vercel Postgres/Neon, Supabase — local Docker only
-works for local dev), set `DATABASE_URL` in Vercel's env vars, then run
-`npx prisma migrate deploy` and `npm run seed` once from a machine with `OPENAI_API_KEY`
-pointed at that production database. The seed job is a multi-minute batch of hundreds of
-OpenAI calls — it should never run as a Vercel serverless function.
+Deployed on Vercel with a Postgres provider supplying `storage_PRISMA_DATABASE_URL` —
+update `prisma/schema.prisma`'s `datasource` block if your provider names it differently.
+`build` runs `prisma migrate deploy && next build`, so every deploy self-migrates through
+Vercel's build-time environment. No manual `migrate deploy` against production — and for
+a "Sensitive"-marked Vercel variable, none is possible, since those are write-only after
+creation and `vercel env pull` can't retrieve them.
+
+For `/batch` in production: install the Inngest Vercel integration (or set
+`INNGEST_EVENT_KEY`/`INNGEST_SIGNING_KEY` manually) — it also syncs the app's functions
+on deploy. Keep `repriceFamilyFn`'s `concurrency` at or below your Inngest plan's limit
+(5 on free); exceeding it makes Inngest silently reject the whole function sync, leaving
+nothing registered to process queued events.
+
+`.vercelignore` excludes `.env`/`.env.local`/`.env.*.local`, since `vercel deploy` doesn't
+reliably respect `.gitignore` for them — a leaked `.env` with `INNGEST_DEV=1` set would
+make production try reaching a local-only Inngest dev server instead of Inngest Cloud.
+
+Set `OPENAI_API_KEY` in Vercel's env vars for `/batch`/`/quote` to run their real LLM
+paths; without it, `/batch` refuses to start and `/quote` falls back to placeholder mode.
