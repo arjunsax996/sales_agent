@@ -1,7 +1,17 @@
 import { categorizeReviewReason } from "@/lib/reviewReasonCategory";
 import type { SerializedProduct } from "./types";
 
-export default function FlagReasonBreakdown({ products }: { products: SerializedProduct[] }) {
+export default function FlagReasonBreakdown({
+  products,
+  selectedReasons,
+  onSelectReason,
+  onClear,
+}: {
+  products: SerializedProduct[];
+  selectedReasons: Set<string>;
+  onSelectReason: (label: string) => void;
+  onClear: () => void;
+}) {
   const flagged = products.filter((p) => p.needsHumanReview);
   if (flagged.length === 0) return null;
 
@@ -17,11 +27,27 @@ export default function FlagReasonBreakdown({ products }: { products: Serialized
       <span className="font-medium uppercase tracking-wide" style={{ color: "var(--text-muted)" }}>
         Why flagged:
       </span>
-      {sorted.map(([label, count]) => (
-        <span key={label} className="rounded-full px-2.5 py-1 font-medium" style={{ background: "var(--amber-soft)", color: "var(--amber)" }}>
-          {label} · {count}
-        </span>
-      ))}
+      {sorted.map(([label, count]) => {
+        const isActive = selectedReasons.has(label);
+        return (
+          <button
+            key={label}
+            type="button"
+            onClick={() => onSelectReason(label)}
+            aria-pressed={isActive}
+            title={isActive ? "Click to remove this filter" : `Add filter: SKUs flagged for ${label}`}
+            className="rounded-full px-2.5 py-1 font-medium transition"
+            style={isActive ? { background: "var(--amber)", color: "white" } : { background: "var(--amber-soft)", color: "var(--amber)" }}
+          >
+            {label} · {count}
+          </button>
+        );
+      })}
+      {selectedReasons.size > 0 && (
+        <button type="button" onClick={onClear} className="font-medium underline" style={{ color: "var(--text-muted)" }}>
+          Clear ({selectedReasons.size})
+        </button>
+      )}
     </div>
   );
 }

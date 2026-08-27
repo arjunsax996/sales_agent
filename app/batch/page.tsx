@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { BatchJobStatus } from "@/lib/batchJob";
+import Spinner from "../Spinner";
 import { checkBatchStatus, uploadAndStartBatch } from "./actions";
 
 export default function BatchPage() {
@@ -79,9 +80,10 @@ export default function BatchPage() {
           type="button"
           disabled={!productsFile || submitting || running}
           onClick={handleSubmit}
-          className="mt-4 rounded-md px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          className="mt-4 inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
           style={{ background: "var(--accent)" }}
         >
+          {(submitting || running) && <Spinner />}
           {submitting ? "Starting…" : running ? "Running…" : "Run batch update"}
         </button>
 
